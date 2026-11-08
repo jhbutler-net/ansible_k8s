@@ -2,7 +2,7 @@
   hosts: all
   serial: 1
   vars:
-    jb_drain_host: k8s-master
+    jb_drain_host: k8s-master-amd
   tasks:
     - name: Update apt cache
       become: true
