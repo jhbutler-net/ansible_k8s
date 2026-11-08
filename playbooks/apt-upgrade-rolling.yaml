@@ -1,15 +1,112 @@
 - name: General update and rolling reboot
   hosts: all
   serial: 1
+  any_errors_fatal: true
   vars:
     jb_drain_host: k8s-master-amd
+    jb_proposed_validate_only: false
+    jb_proposed_mirror: >-
+      {{ 'https://archive.ubuntu.com/ubuntu' if jb_dpkg_arch == 'amd64'
+         else 'https://ports.ubuntu.com/ubuntu-ports' }}
+    jb_proposed_source: >-
+      deb [arch={{ jb_dpkg_arch }} signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg]
+      {{ jb_proposed_mirror }} {{ ansible_facts['distribution_release'] }}-proposed main restricted
+    jb_proposed_preferences: |
+      Package: linux-*
+      Pin: release o=Ubuntu,a={{ ansible_facts['distribution_release'] }}-proposed
+      Pin-Priority: 990
+
+      Package: *
+      Pin: release o=Ubuntu,a={{ ansible_facts['distribution_release'] }}-proposed
+      Pin-Priority: -1
   tasks:
-    - name: Update apt cache
+    - name: Validate Ubuntu proposed repository support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+          - ansible_facts['architecture'] in ['x86_64', 'aarch64']
+        fail_msg: This playbook supports Ubuntu amd64 and arm64 hosts.
+
+    - name: Map host architecture to Ubuntu package architecture
+      ansible.builtin.set_fact:
+        jb_dpkg_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+
+    # Install preferences before enabling the pocket so unrelated proposed
+    # packages cannot become candidates during a cache refresh.
+    - name: Prefer proposed kernel packages and exclude other proposed updates
       become: true
-      become_user: root
-      ansible.builtin.apt:
-        update_cache: true
-        cache_valid_time: 86400 # One day
+      ansible.builtin.copy:
+        dest: /etc/apt/preferences.d/jb-ubuntu-proposed
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ jb_proposed_preferences }}"
+
+    - name: Enable Ubuntu proposed for the host release and architecture
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/jb-ubuntu-proposed.list
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ jb_proposed_source }}\n"
+
+    - name: Read back proposed configuration until it matches
+      become: true
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop:
+        - path: /etc/apt/sources.list.d/jb-ubuntu-proposed.list
+          expected: "{{ jb_proposed_source }}\n"
+        - path: /etc/apt/preferences.d/jb-ubuntu-proposed
+          expected: "{{ jb_proposed_preferences }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: jb_proposed_readback
+      until: (jb_proposed_readback.content | default('') | b64decode) == item.expected
+      retries: 3
+      delay: 2
+      when: not ansible_check_mode
+
+    # apt-get otherwise permits some failed downloads with a successful exit.
+    - name: Refresh all apt indexes and fail on any download error
+      become: true
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - update
+          - --error-on=any
+      register: jb_apt_cache_refresh
+      changed_when: false
+      until: jb_apt_cache_refresh.rc == 0
+      retries: 3
+      delay: 5
+      when: not ansible_check_mode
+
+    - name: Validate loaded proposed indexes and effective kernel priorities
+      ansible.builtin.script:
+        cmd: >-
+          ../scripts/validate-proposed.py
+          {{ ansible_facts['distribution_release'] | quote }}
+          {{ jb_dpkg_arch | quote }}
+        executable: /usr/bin/python3
+      environment:
+        LC_ALL: C
+      register: jb_proposed_validation
+      changed_when: false
+      until: jb_proposed_validation.rc == 0
+      retries: 3
+      delay: 5
+      when: not ansible_check_mode
+
+    - name: Show proposed validation evidence
+      ansible.builtin.debug:
+        var: jb_proposed_validation.stdout_lines
+      when: not ansible_check_mode
+
+    - name: Stop after proposed configuration and validation when requested
+      ansible.builtin.meta: end_host
+      when: jb_proposed_validate_only | bool or ansible_check_mode
 
     - name: Check for upgradable packages
       ansible.builtin.command:
@@ -38,6 +135,7 @@
       ansible.builtin.command:
         cmd: >-
           kubectl drain {{ inventory_hostname }}
+          --force
           --ignore-daemonsets
           --delete-emptydir-data
           --timeout=10m
@@ -57,12 +155,12 @@
     - name: Check if reboot required
       ansible.builtin.stat:
         path: /var/run/reboot-required
-      register: reboot_required_file
+      register: jb_reboot_required_file
     - name: Reboot if required
       become: true
       become_user: root
       ansible.builtin.reboot:
-      when: reboot_required_file.stat.exists
+      when: jb_reboot_required_file.stat.exists
 
     - name: Wait for node to become Ready in the cluster
       ansible.builtin.command:
